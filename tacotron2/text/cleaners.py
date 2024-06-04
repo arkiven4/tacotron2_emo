@@ -88,3 +88,10 @@ def english_cleaners(text):
   text = expand_abbreviations(text)
   text = collapse_whitespace(text)
   return text
+
+def universal_cleaners(text):
+  '''Basic pipeline that lowercases and collapses whitespace without transliteration.'''
+  text = convert_to_ascii(text)
+  text = lowercase(text)
+  text = collapse_whitespace(text)
+  return text

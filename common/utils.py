@@ -45,20 +45,23 @@ def load_wav_to_torch(full_path):
 
 def load_filepaths_and_text(filename, use_emotions=False, split="|"):
     with open(filename, encoding='utf-8') as f:
-        def split_line(line):
-            parts = line.strip().split(split)
-            if len(parts) > 4:
-                raise Exception(
-                    "incorrect line format for file: {}".format(filename))
-
-            path = parts[0]
-            text = parts[1]
-            speaker_id = int(parts[2])
-            emotion_id = int(parts[3]) if use_emotions else None
-
-            return path, text, speaker_id, emotion_id
-        filepaths_and_text = [split_line(line) for line in f]
+        filepaths_and_text = [line.strip().split(split) for line in f] #if int(line.strip().split(split)[1]) == 0 or int(line.strip().split(split)[1]) == 2
     return filepaths_and_text
+    # with open(filename, encoding='utf-8') as f:
+    #     def split_line(line):
+    #         parts = line.strip().split(split)
+    #         if len(parts) > 4:
+    #             raise Exception(
+    #                 "incorrect line format for file: {}".format(filename))
+
+    #         path = parts[0]
+    #         text = parts[1]
+    #         speaker_id = int(parts[2])
+    #         emotion_id = int(parts[3]) if use_emotions else None
+
+    #         return path, text, speaker_id, emotion_id
+    #     filepaths_and_text = [split_line(line) for line in f]
+    # return filepaths_and_text
 
 
 def to_gpu(x):

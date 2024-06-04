@@ -45,30 +45,31 @@ warnings.filterwarnings('ignore')
 # Torch
 import torch
 import torch.distributed as dist
-from torch.utils import tensorboard
+from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data.sampler import WeightedRandomSampler
+
+from tacotron2.model import Tacotron2
+
+import torch.multiprocessing as mp
+import torch.distributed as dist
 
 # Distributed + AMP
-from apex.parallel import DistributedDataParallel as DDP
-from apex import amp
-amp.lists.functional_overrides.FP32_FUNCS.remove('softmax')
-amp.lists.functional_overrides.FP16_FUNCS.append('softmax')
+from torch.nn.parallel import DistributedDataParallel
+from torch.cuda.amp import autocast, GradScaler
+#from apex.parallel import DistributedDataParallel as DDP
 
-# Parse args
-parser = argparse.ArgumentParser(description='PyTorch Tacotron 2 Training')
-parser.add_argument('--exp', type=str, default=None, required=True, help='Name of an experiment for configs setting.')
-parser.add_argument('--rank', default=0, type=int, help='Rank of the process, do not set! Done by multiproc module')
-parser.add_argument('--world-size', default=1, type=int, help='Number of processes, do not set! Done by multiproc module')
-args = parser.parse_args()
+from tacotron2.data_function import batch_to_gpu, TextMelLoader, TextMelCollate, DistributedBucketSampler
+from tacotron2.loss_function import Tacotron2Loss
 
-# Prepare config
-shutil.copyfile(os.path.join('configs', 'experiments', args.exp + '.py'), os.path.join('configs', '__init__.py'))
+import utils
+
+import bitsandbytes as bnb
 
 # Reload Config
 configs = importlib.import_module('configs')
 configs = importlib.reload(configs)
-
 
 Config = configs.Config
 PConfig = configs.PreprocessingConfig
@@ -93,28 +94,7 @@ def reduce_tensor(tensor, num_gpus):
     return rt
 
 
-def init_distributed(world_size, rank):
-    """
-
-    :param world_size:
-    :param rank:
-    :return:
-    """
-    assert torch.cuda.is_available(), 'Distributed mode requires CUDA.'
-    print('Initializing Distributed')
-
-    # Set cuda device so everything is done on the right GPU.
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-
-    # Initialize distributed communication
-    dist.init_process_group(
-        backend=Config.dist_backend, init_method=Config.dist_url,
-        world_size=world_size, rank=rank, group_name=Config.group_name)
-
-    print('Done initializing distributed')
-
-
-def restore_checkpoint(restore_path, model_name):
+def restore_checkpoint(restore_path, model, optimizer):
     """
 
     :param restore_path:
@@ -123,11 +103,9 @@ def restore_checkpoint(restore_path, model_name):
     """
     checkpoint = torch.load(restore_path, map_location='cpu')
     start_epoch = checkpoint['epoch'] + 1
+    start_iter = checkpoint['iteration'] + 1
 
     print('Restoring from `{}` checkpoint'.format(restore_path))
-
-    model_config = checkpoint['config']
-    model = models.get_model(model_name, model_config, to_cuda=True)
 
     # Unwrap distributed
     model_dict = {}
@@ -137,11 +115,14 @@ def restore_checkpoint(restore_path, model_name):
         model_dict[new_key] = value
 
     model.load_state_dict(model_dict)
+    
+    print('Restoring optimizer state')
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
-    return model, model_config, checkpoint, start_epoch
+    return model, optimizer, start_epoch, start_iter
 
 
-def save_checkpoint(model, epoch, config, optimizer, filepath):
+def save_checkpoint(model, epoch, iteration, config, optimizer, filepath):
     """
 
     :param model:
@@ -151,61 +132,12 @@ def save_checkpoint(model, epoch, config, optimizer, filepath):
     :param filepath:
     :return:
     """
-    print('Saving model and optimizer state at epoch {} to {}'.format(
-        epoch, filepath))
+    print('Saving model and optimizer state at epoch {} to {}'.format(epoch, filepath))
     torch.save({'epoch': epoch,
+                'iteration': iteration,
                 'config': config,
                 'state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict()}, filepath)
-
-
-def save_sample(model_name, model_path):
-    """
-
-    :param model_name:
-    :param model_path:
-    :return:
-    """
-    if model_name == 'Tacotron2':
-        assert Config.waveglow_checkpoint is not None, 'WaveGlow checkpoint path is missing, could not generate sample'
-        tacotron2_path = model_path
-        waveglow_path = Config.waveglow_checkpoint
-
-    elif model_name == 'WaveGlow':
-        assert Config.tacotron2_checkpoint is not None, 'Taco2 checkpoint path is missing, could not generate sample'
-        waveglow_path = model_path
-        tacotron2_path = Config.tacotron2_checkpoint
-
-    else:
-        raise NotImplementedError('Unknown model requested: {}'.format(model_name))
-
-    t2, _, _, _ = restore_checkpoint(tacotron2_path, 'Tacotron2')
-    wg, _, _, _ = restore_checkpoint(waveglow_path, 'WaveGlow')
-
-    with evaluating(t2), evaluating(wg), torch.no_grad():
-        for speaker_id in Config.phrases['speaker_ids']:
-            for text in Config.phrases['texts']:
-                inp = np.array(text_to_sequence(text, ['english_cleaners']))[None, :]
-                inp = torch.from_numpy(inp).to(device='cuda', dtype=torch.int64)
-
-                s_id = torch.IntTensor([speaker_id]).cuda().long()
-
-                if Config.use_emotions:
-                    for emotion, emotion_id in PConfig.emo_id_map.items():
-                        e_id = torch.IntTensor([emotion_id]).cuda().long()
-                        _, mel, _, alignments = t2.infer(inp, s_id, e_id)
-                        audio = wg.infer(mel)
-                        audio_numpy = audio[0].data.cpu().numpy()
-                        alignments_numpy = alignments[0].data.cpu().numpy()
-
-                        yield speaker_id, emotion, audio_numpy, alignments_numpy, mel
-                else:
-                    _, mel, _, alignments = t2.infer(inp, s_id)
-                    audio = wg.infer(mel)
-                    audio_numpy = audio[0].data.cpu().numpy()
-                    alignments_numpy = alignments[0].data.cpu().numpy()
-
-                    yield speaker_id, None, audio_numpy, alignments_numpy, mel
 
 # adapted from: https://discuss.pytorch.org/t/opinion-eval-should-be-a-context-manager/18998/3
 # Following snippet is licensed under MIT license
@@ -325,111 +257,121 @@ def balance_loss(x, y, y_pred, criterion):
 
 
 def main():
-    # Experiment dates
-    str_date, str_time = datetime.now().strftime("%d-%m-%yT%H-%M-%S").split('T')
+    """Assume Single Node Multi GPUs Training Only"""
+    assert torch.cuda.is_available(), "CPU training is not allowed."
 
-    # Directories paths
-    main_directory = os.path.join(Config.output_directory, args.exp, str_date, str_time)
-    tf_directory = os.path.join(main_directory, 'tb_events')
-    checkpoint_directory = os.path.join(main_directory, 'checkpoints')
-    print('Experiment path: `{}`'.format(main_directory))
+    n_gpus = torch.cuda.device_count()
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "65530"
 
-    # Directories check
-    if args.rank == 0:
-        if not os.path.exists(main_directory):
-            os.makedirs(main_directory)
-    if args.rank == 0:
-        if not os.path.exists(checkpoint_directory):
-            os.makedirs(checkpoint_directory)
+    mp.spawn(
+        train_and_eval,
+        nprocs=n_gpus,
+        args=(
+            n_gpus,
+        ),
+    )
 
-    if args.rank == 0:
-        if not os.path.exists(tf_directory):
-            os.makedirs(tf_directory)
+def train_and_eval(rank, n_gpus):
+    if rank == 0:
+        logger = utils.get_logger(Config.model_dir)
+        logger.info(Config)
+        writer = SummaryWriter(log_dir=Config.model_dir)
+        writer_eval = SummaryWriter(log_dir=os.path.join(Config.model_dir, "eval"))
 
-    # Experiment files set up
-    if args.rank == 0:
-        tensorboard_writer = tensorboard.SummaryWriter(log_dir=tf_directory)
-        shutil.copy2('configs/__init__.py', os.path.join(main_directory, 'config.py'))
-        with open(os.path.join(main_directory, 'args.json'), 'w') as fl:
-            json.dump(vars(args), fl, indent=4)
+    dist.init_process_group(
+        backend="nccl", init_method="env://", world_size=n_gpus, rank=rank
+    )
+    torch.manual_seed(Config.seed)
+    torch.cuda.set_device(rank)
 
-    # Enable cuda
-    torch.backends.cudnn.enabled = Config.cudnn_enabled
-    torch.backends.cudnn.benchmark = Config.cudnn_benchmark
+    # Weight Sampler
+    with open(Config.training_files, "r") as txt_file:
+        lines = txt_file.readlines()
+        
+    attr_names_samples = np.array([item.split("|")[1] for item in lines])
+    unique_attr_names = np.unique(attr_names_samples).tolist()
+    attr_idx = [unique_attr_names.index(l) for l in attr_names_samples]
+    attr_count = np.array(
+        [len(np.where(attr_names_samples == l)[0]) for l in unique_attr_names]
+    )
 
-    # Set model name & Init distributed
-    model_name = Config.model_name
-    distributed_run = args.world_size > 1
+    weight_attr = 1.0 / attr_count
+    dataset_samples_weight = np.array([weight_attr[l] for l in attr_idx])
+    dataset_samples_weight = dataset_samples_weight / np.linalg.norm(
+        dataset_samples_weight
+    )
 
-    if distributed_run:
-        init_distributed(args.world_size, args.rank)
+    weights, attr_names, attr_weights = (
+        torch.from_numpy(dataset_samples_weight).float(),
+        unique_attr_names,
+        np.unique(dataset_samples_weight).tolist(),
+    )
+    weights = weights * 1.0
+    w_sampler = WeightedRandomSampler(weights, len(weights))
 
-    # Restore training from checkpoint
-    if Config.restore_from:
-        model, model_config, checkpoint, start_epoch = restore_checkpoint(Config.restore_from, model_name)
+    train_dataset = TextMelLoader(Config.training_files, Config.text_cleaners,
+                                    Config.load_mel_from_dist, Config.max_wav_value,
+                                    Config.sampling_rate, Config.filter_length, Config.hop_length,
+                                    Config.win_length, Config.n_mel_channels, Config.mel_fmin,
+                                    Config.mel_fmax, Config)
+    train_sampler = DistributedBucketSampler(
+        train_dataset,
+        Config.batch_size,
+        [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+        num_replicas=n_gpus,
+        rank=rank,
+        shuffle=True,
+        weights=w_sampler,
+    )
+    collate_fn = TextMelCollate(Config.n_frames_per_step)
+    train_loader = DataLoader(
+        train_dataset,
+        num_workers=8,
+        shuffle=False,
+        pin_memory=True,
+        collate_fn=collate_fn,
+        batch_sampler=train_sampler,
+    )
+
+    if rank == 0:
+        val_dataset = TextMelLoader(Config.validation_files, Config.text_cleaners,
+                                    Config.load_mel_from_dist, Config.max_wav_value,
+                                    Config.sampling_rate, Config.filter_length, Config.hop_length,
+                                    Config.win_length, Config.n_mel_channels, Config.mel_fmin,
+                                    Config.mel_fmax, Config)
+
+    model = Tacotron2(**Config).cuda()
+
+    optimizer = bnb.optim.AdamW(
+        model.parameters(),
+        Config.learning_rate,
+        betas=Config.betas,
+        eps=Config.eps,
+    )
+
+    model = DistributedDataParallel(model, device_ids=[rank])
+
+    start_epoch = 0
+    start_iter = 0
+
+    scaler = GradScaler(enabled=Config.fp16_run)
+
+    if Config.warm_start:
+        model = utils.warm_start_model(Config.warm_start_checkpoint, model, Config.ignored_layer)
     else:
-        checkpoint, start_epoch = None, 0
+        try:
+            print('Loading Checkpoint state')
+            model, optimizer, start_epoch, start_iter = restore_checkpoint(utils.latest_checkpoint_path(Config.model_dir, "tc2emo_*.pt"), model, optimizer)
+            #utils.load_checkpoint(model, optimizer, scaler, start_epoch, start_iter, Config.fp16_run, )
+        except Exception as e:
+            print("Not Found Checkpoint")
+            print(e)
 
-        model_config = models.get_model_config(model_name)
-        model = models.get_model(model_name, model_config, to_cuda=True)
+    sigma = None
+    criterion = Tacotron2Loss()
 
-    # Distributed run
-    if not Config.amp_run and distributed_run:
-        model = DDP(model)
-
-    # Define Optimizer
-    optimizer = torch.optim.Adam(model.parameters(),
-                                 lr=Config.learning_rate,
-                                 weight_decay=Config.weight_decay)
-
-    # Restore optimizer state
-    if checkpoint and 'optimizer_state_dict' in checkpoint:
-        print('Restoring optimizer state')
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    # FP16 option
-    if Config.amp_run:  # TODO: test if FP16 actually works
-        model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-        if distributed_run:
-            model = DDP(model)
-
-    # Set sigma for WaveGlow loss
-    try:
-        sigma = model_config['sigma']
-    except KeyError:
-        sigma = None
-        if model_name == 'WaveGlow':
-            model_config['sigma'] = Config.wg_sigma
-            sigma = model_config['sigma']
-
-    # Set criterion
-    criterion = loss_functions.get_loss_function(model_name, sigma)
-
-    # Set amount of frames per decoder step
-    try:  # TODO: make it working with n > 1
-        n_frames_per_step = model_config['n_frames_per_step']
-    except KeyError:
-        n_frames_per_step = None
-
-    # Set dataloaders
-    collate_fn = data_functions.get_collate_function(model_name, n_frames_per_step)
-    trainset = data_functions.get_data_loader(model_name=model_name, audiopaths_and_text=Config.training_files)
-    train_sampler = DistributedSampler(trainset) if distributed_run else None
-    train_loader = DataLoader(trainset,
-                              num_workers=1,
-                              shuffle=False,
-                              sampler=train_sampler,
-                              batch_size=Config.batch_size,
-                              pin_memory=False,
-                              drop_last=True,
-                              collate_fn=collate_fn)
-    valset = data_functions.get_data_loader(model_name=model_name, audiopaths_and_text=Config.validation_files)
-    batch_to_gpu = data_functions.get_batch_to_gpu(model_name)
-
-    # Iteration inside of the epoch
-    iteration = 0
-
-    # Set model into training mode
+    iteration = start_iter
     model.train()
 
     # Training loop
@@ -447,23 +389,29 @@ def main():
             train_epoch_avg_items_per_sec = 0.0
             num_iters = 0
 
-            if args.rank == 0:
+            if rank == 0:
                 pb = tqdm(enumerate(train_loader), total=len(train_loader), desc=f'Epoch: {epoch}/{Config.epochs}')
             else:
                 pb = enumerate(train_loader)
 
             for i, batch in pb:
                 iter_start_time = time.time()
-                adjust_learning_rate(epoch, optimizer, learning_rate=Config.learning_rate,
-                                     anneal_steps=Config.anneal_steps, anneal_factor=Config.anneal_factor)
+                adjust_learning_rate(epoch, optimizer, learning_rate=Config.learning_rate, anneal_steps=Config.anneal_steps, anneal_factor=Config.anneal_factor)
                 model.zero_grad()
                 x, y, num_items = batch_to_gpu(batch)
-                y_pred = model(x)
 
-                loss = balance_loss(x, y, y_pred, criterion) if Config.use_loss_coefficients else criterion(y_pred, y)
+                with autocast(enabled=Config.amp_run):
+                    y_pred = model(x)
 
-                if distributed_run:
-                    reduced_loss = reduce_tensor(loss.data, args.world_size)
+                    loss = balance_loss(x, y, y_pred, criterion) if Config.use_loss_coefficients else criterion(y_pred, y)
+
+                if Config.amp_run:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                if Config.distributed_run:
+                    reduced_loss = reduce_tensor(loss.data, n_gpus)
                     reduced_num_items = reduce_tensor(num_items.data, 1)
                 else:
                     reduced_loss = loss.item()
@@ -479,16 +427,13 @@ def main():
                 reduced_num_items_epoch += reduced_num_items
 
                 if Config.amp_run:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                        torch.nn.utils.clip_grad_norm_(
-                        amp.master_params(optimizer), Config.grad_clip_thresh)
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip_thresh)
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), Config.grad_clip_thresh)
-
-                optimizer.step()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip_thresh)
+                    optimizer.step()
 
                 iteration += 1
 
@@ -504,56 +449,60 @@ def main():
 
             train_epoch_avg_items_per_sec = train_epoch_avg_items_per_sec / num_iters if num_iters > 0 else 0.0
             train_epoch_avg_loss = train_epoch_avg_loss / num_iters if num_iters > 0 else 0.0
-            epoch_val_loss = validate(model, criterion, valset, Config.batch_size, args.world_size,
-                                      collate_fn, distributed_run, batch_to_gpu)
+            epoch_val_loss = validate(model, criterion, val_dataset, Config.batch_size, n_gpus, collate_fn, Config.distributed_run, batch_to_gpu)
 
-            if args.rank == 0:
-                tensorboard_writer.add_scalar(tag='train_stats/epoch_items_per_sec',
-                                              scalar_value=train_epoch_items_per_sec,
-                                              global_step=epoch)
-                tensorboard_writer.add_scalar(tag='train_stats/epoch_avg_items_per_sec',
-                                              scalar_value=train_epoch_avg_items_per_sec,
-                                              global_step=epoch)
-                tensorboard_writer.add_scalar(tag='train_stats/epoch_time',
-                                              scalar_value=epoch_time,
-                                              global_step=epoch)
-                tensorboard_writer.add_scalar(tag='epoch_avg_loss/train',
-                                              scalar_value=train_epoch_avg_loss,
-                                              global_step=epoch)
-                tensorboard_writer.add_scalar(tag='epoch_avg_loss/val',
-                                              scalar_value=epoch_val_loss,
-                                              global_step=epoch)
-
-            if epoch != 0 and epoch % Config.epochs_per_checkpoint == 0 and args.rank == 0:
-                checkpoint_path = os.path.join(checkpoint_directory, 'checkpoint_{}'.format(epoch))
-                save_checkpoint(model, epoch, model_config, optimizer, checkpoint_path)
-                # Save test audio files to tensorboard
-                total = len(Config.phrases['speaker_ids']) * len(Config.phrases['texts'])
-                if Config.use_emotions:
-                    total *= len(PConfig.emo_id_map)
-
-                generation_pb = tqdm(
-                    enumerate(save_sample(model_name, checkpoint_path)),
-                    total=total
+            if rank == 0:
+                utils.summarize(
+                    writer=writer,
+                    global_step=iteration,
+                    scalars={
+                        "loss/g/total": train_epoch_avg_loss,
+                        "learning_rate": optimizer.param_groups[0]["lr"],
+                        "grad_norm": grad_norm,
+                        "train_stats/epoch_items_per_sec": train_epoch_items_per_sec,
+                        "train_stats/epoch_avg_items_per_sec": train_epoch_avg_items_per_sec,
+                        "train_stats/epoch_time": epoch_time,
+                    },
                 )
 
-                for i, (speaker_id, emotion, sample, alignment, mel) in generation_pb:
-                    sample = remove_crackle(sample, Config.wdth, Config.snst)
+                utils.summarize(
+                    writer=writer_eval,
+                    global_step=iteration,
+                    scalars={
+                        "loss/g/total": epoch_val_loss,
+                    },
+                )
 
-                    tag = 'epoch_{}/infer:speaker_{}_sample_{}'.format(epoch, speaker_id, i)
-                    tag = '{}_emotion_{}'.format(tag, emotion) if Config.use_emotions else tag
+            if epoch != 0 and epoch % Config.epochs_per_checkpoint == 0 and rank == 0:
+                checkpoint_path = os.path.join(Config.model_dir, 'checkpoint_{}'.format(epoch))
+                save_checkpoint(model, epoch, iteration, Config, optimizer, checkpoint_path)
 
-                    # Don't add audio to tb if it's too large
-                    if mel.shape[-1] < Config.max_frames:
-                        tensorboard_writer.add_audio(tag=tag, snd_tensor=sample, sample_rate=Config.sampling_rate)
+                with evaluating(model), torch.no_grad():
+                    val_sampler = DistributedSampler(val_dataset) if Config.distributed_run else None
+                    val_loader = DataLoader(val_dataset, num_workers=1, shuffle=False, sampler=val_sampler, batch_size=Config.batch_size, pin_memory=False, collate_fn=collate_fn)
 
-                    fig = plt.figure(figsize=(10, 10))
-                    plt.imshow(alignment, aspect='auto')
-                    tensorboard_writer.add_figure(tag=tag, figure=fig)
+                    for i, batch in enumerate(val_loader):
+                        if i > 2:
+                            break
+                        
+                        batch = batch[:1]
+                        x, y, len_x = batch_to_gpu(batch)
+                        _, mel, _, alignments = model.infer(x[0], langs=x[5], speakers=x[6], emos=x[7])
+                        alignments_numpy = alignments[0].data.cpu().numpy()
 
-    if args.rank == 0:
-        tensorboard_writer.close()
-
+                        utils.summarize(
+                            writer=writer,
+                            global_step=iteration,
+                            images={
+                                i + "_y_org": utils.plot_spectrogram_to_numpy(
+                                    y[0].data.cpu().numpy()
+                                ),
+                                i + "_y_gen": utils.plot_spectrogram_to_numpy(
+                                    mel.data.cpu().numpy()
+                                ),
+                                i + "_attn": alignments_numpy,
+                            },
+                        )
 
 if __name__ == '__main__':
     main()

@@ -1,7 +1,8 @@
-from tacotron2.text import symbols
 global symbols
+from tacotron2.text import symbols
 import json
 import numpy as np
+import os
 
 
 class Config:
@@ -22,11 +23,11 @@ class Config:
     # ** Tacotron Params **
     # Symbols
     n_symbols = len(symbols)                     # Number of symbols in dictionary
-    symbols_embedding_dim = 512                  # Text input embedding dimension
+    symbols_embedding_dim = 508                  # Text input embedding dimension
 
     # Speakers
     n_speakers = 128                             # Number of speakers
-    speakers_embedding_dim = 16                  # Speaker embedding dimension
+    speakers_embedding_dim = 128                  # Speaker embedding dimension
     try:
         speaker_coefficients = json.load(open('/mnt/train/speaker_coefficients.json'))  # Dict with speaker coefficients
     except IOError:
@@ -36,12 +37,19 @@ class Config:
     # Emotions
     use_emotions = True                          # Use emotions
     n_emotions = 15                              # N emotions
-    emotions_embedding_dim = 8                   # Emotion embedding dimension
+    emotions_embedding_dim = 128                   # Emotion embedding dimension
     try:
         emotion_coefficients = json.load(open('/mnt/train/emotion_coefficients.json'))  # Dict with emotion coefficients
     except IOError:
         print("Emotion coefficients dict is not available")
         emotion_coefficients = None
+
+    n_lang = 10
+    lin_channels = 4
+
+    spk_embeds_path="/run/media/fourier/Data2/Pras/Thesis/Database/dataset_name/spk_embeds/",
+    emo_embeds_path="/run/media/fourier/Data2/Pras/Thesis/Database/dataset_name/emo_embeds/",
+    database_name_index=8,
 
     # Encoder
     encoder_kernel_size = 5                      # Encoder kernel size
@@ -95,6 +103,7 @@ class Config:
     )
 
     # ** Script args **
+    model_dir = os.path.join("./logs", "tct2_emo")
     model_name = "Tacotron2"
     output_directory = "/mnt/logs"                   # Directory to save checkpoints
     log_file = "nvlog.json"                      # Filename for logging
